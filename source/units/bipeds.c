@@ -522,6 +522,156 @@ static void biped_snap_facing(
 boolean debug_biped_physics = FALSE;
 boolean debug_biped_skip_update = FALSE;
 boolean debug_biped_skip_collision = FALSE;
+
+/* ---------- Mario 64 moveset */
+
+/* Players move like Mario in Super Mario 64: jumps chain into a double and
+a triple jump, crouch with a jump makes a long jump or a backflip, crouch in
+the air makes a ground pound, and falls do not hurt. */
+
+enum
+{
+	MARIO_PLAYER_SLOTS = 128,
+	MARIO_CHAIN_WINDOW_TICKS = 12,
+	MARIO_POUND_MINIMUM_AIR_TICKS = 6,
+	MARIO_POUND_HOVER_TICKS = 8,
+};
+
+#define MARIO_LONG_JUMP_MINIMUM_SPEED 0.012f
+#define MARIO_LONG_JUMP_SPEED 0.075f
+#define MARIO_LONG_JUMP_HEIGHT_SCALE 0.55f
+#define MARIO_BACKFLIP_HEIGHT_SCALE 1.45f
+#define MARIO_BACKFLIP_SPEED 0.03f
+#define MARIO_POUND_SPEED 0.4f
+
+struct mario_state
+{
+	short chain;
+	short chain_ticks;
+	short air_ticks;
+	short pound_hover_ticks;
+	boolean pounding;
+	boolean was_airborne;
+};
+
+boolean biped_mario_moveset = TRUE;
+
+static struct mario_state mario_states[MARIO_PLAYER_SLOTS];
+static real const mario_jump_scales[3] = { 1.f, 1.2f, 1.75f };
+
+static struct mario_state *biped_mario_get(
+	struct biped_datum *biped)
+{
+	if (!biped_mario_moveset ||
+		biped->unit.player_index == NONE ||
+		TEST_FLAG(biped->object.damage_flags, _object_dead_bit))
+		return NULL;
+
+	return &mario_states[DATUM_INDEX_TO_ABSOLUTE_INDEX(biped->unit.player_index) %
+		MARIO_PLAYER_SLOTS];
+}
+
+static void biped_mario_update(
+	long biped_index)
+{
+	struct biped_datum *biped = biped_get(biped_index);
+	struct mario_state *mario = biped_mario_get(biped);
+
+	if (!mario)
+		return;
+
+	if (TEST_FLAG(biped->biped.flags, _biped_airborne_bit))
+	{
+		real_vector3d *velocity = &biped->object.translational_velocity;
+
+		if (mario->air_ticks < SHRT_MAX)
+			++mario->air_ticks;
+
+		if (!mario->pounding &&
+			mario->air_ticks > MARIO_POUND_MINIMUM_AIR_TICKS &&
+			TEST_FLAG(biped->unit.control_flags, _unit_control_crouch_modifier_bit))
+		{
+			mario->pounding = TRUE;
+			mario->pound_hover_ticks = MARIO_POUND_HOVER_TICKS;
+		}
+
+		if (mario->pounding)
+		{
+			if (mario->pound_hover_ticks > 0)
+			{
+				--mario->pound_hover_ticks;
+				velocity->i = velocity->j = velocity->k = 0.f;
+			}
+			else
+			{
+				velocity->i = velocity->j = 0.f;
+				velocity->k = -MARIO_POUND_SPEED;
+			}
+		}
+	}
+	else
+	{
+		if (mario->was_airborne)
+			mario->chain_ticks = MARIO_CHAIN_WINDOW_TICKS;
+		else if (mario->chain_ticks > 0 && --mario->chain_ticks == 0)
+			mario->chain = 0;
+		mario->air_ticks = 0;
+		mario->pounding = FALSE;
+	}
+
+	mario->was_airborne = TEST_FLAG(biped->biped.flags, _biped_airborne_bit);
+}
+
+/* Changes the velocity of a jump that starts now. */
+static void biped_mario_jump(
+	long biped_index,
+	real *jump_magnitude,
+	real_vector3d *jump_velocity)
+{
+	struct biped_datum *biped = biped_get(biped_index);
+	struct mario_state *mario = biped_mario_get(biped);
+	real speed;
+
+	if (!mario)
+		return;
+
+	speed = square_root(jump_velocity->i*jump_velocity->i + jump_velocity->j*jump_velocity->j);
+
+	if (TEST_FLAG(biped->unit.control_flags, _unit_control_crouch_modifier_bit))
+	{
+		mario->chain = 0;
+		if (speed > MARIO_LONG_JUMP_MINIMUM_SPEED)
+		{
+			/* long jump */
+			real scale = MARIO_LONG_JUMP_SPEED / speed;
+
+			*jump_magnitude *= MARIO_LONG_JUMP_HEIGHT_SCALE;
+			jump_velocity->i *= scale;
+			jump_velocity->j *= scale;
+		}
+		else
+		{
+			/* backflip */
+			real_vector3d facing;
+
+			unit_get_facing_vector(biped_index, &facing);
+			*jump_magnitude *= MARIO_BACKFLIP_HEIGHT_SCALE;
+			jump_velocity->i = -facing.i*MARIO_BACKFLIP_SPEED;
+			jump_velocity->j = -facing.j*MARIO_BACKFLIP_SPEED;
+		}
+	}
+	else
+	{
+		if (mario->chain_ticks > 0 && speed > MARIO_LONG_JUMP_MINIMUM_SPEED)
+			mario->chain = (mario->chain + 1) % 3;
+		else
+			mario->chain = 0;
+
+		*jump_magnitude *= mario_jump_scales[mario->chain];
+	}
+
+	mario->chain_ticks = 0;
+}
 boolean debug_biped_limp_body_disable = FALSE;
 boolean rider_ejection = TRUE;
 
@@ -790,6 +940,7 @@ static void biped_falling_damage(
 		0,
 		struct game_globals_falling_damage);
 	boolean immune =
+		biped_mario_get(biped) ||
 		TEST_FLAG(biped->unit.flags, _unit_no_falling_damage_bit) ||
 		TEST_FLAG(definition->biped.flags, _biped_immune_to_falling_damage_bit);
 	real falling_velocity = biped->object.translational_velocity.k;
@@ -1862,6 +2013,7 @@ static boolean biped_jump(
 			jump_magnitude *= 4.f;
 
 		jump_velocity = biped->object.translational_velocity;
+		biped_mario_jump(biped_index, &jump_magnitude, &jump_velocity);
 		{
 			real upward_velocity =
 				jump_velocity.i*biped->object.up.i +
@@ -2201,6 +2353,7 @@ static void biped_update_jumping(
 	struct biped_datum *biped = biped_get(biped_index);
 
 	biped_definition_get(biped->definition_index);
+	biped_mario_update(biped_index);
 	if (!TEST_FLAG(biped->biped.flags, _biped_airborne_bit) &&
 		biped->biped.landing != 1)
 	{
